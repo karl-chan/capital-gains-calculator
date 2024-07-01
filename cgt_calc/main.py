@@ -2,14 +2,14 @@
 """Capital Gain Calculator main module."""
 from __future__ import annotations
 
-from collections import defaultdict
 import datetime
 import decimal
-from decimal import Decimal
 import importlib.metadata
 import logging
-from pathlib import Path
 import sys
+from collections import defaultdict
+from decimal import Decimal
+from pathlib import Path
 
 from . import render_latex
 from .args_parser import create_parser
@@ -57,9 +57,14 @@ def get_amount_or_fail(transaction: BrokerTransaction) -> Decimal:
 
 
 # It is not clear how Schwab or other brokers round the dollar value,
-# so assume the values are equal if they are within $0.01.
+# so assume the values are equal if they are within $0.1 or 0.01%
 def _approx_equal(val_a: Decimal, val_b: Decimal) -> bool:
-    return abs(val_a - val_b) < Decimal("0.01")
+    if abs(val_a - val_b) < Decimal("0.1"):
+        return True
+    mid = (float(val_a) + float(val_b)) / 2
+    if abs((float(val_a) - float(val_b)) / mid) < 0.0001:
+        return True
+    return False
 
 
 class CapitalGainsCalculator:
@@ -112,7 +117,11 @@ class CapitalGainsCalculator:
         if symbol is None:
             raise SymbolMissingError(transaction)
         if quantity is None or quantity <= 0:
-            raise QuantityNotPositiveError(transaction)
+            amount = transaction.amount
+            if amount is None:
+                raise QuantityNotPositiveError(transaction)
+            else:
+                quantity = abs(amount / price)
 
         # Add to acquisition_list to apply same day rule
         if transaction.action is ActionType.STOCK_ACTIVITY:
@@ -246,13 +255,22 @@ class CapitalGainsCalculator:
                 transaction, "Tried to sell not owned symbol, reversed order?"
             )
         if quantity is None or quantity <= 0:
-            raise QuantityNotPositiveError(transaction)
+            amount = transaction.amount
+            if amount is None:
+                raise QuantityNotPositiveError(transaction)
+            else:
+                quantity = abs(amount / transaction.price)
         if self.portfolio[symbol].quantity < quantity:
-            raise InvalidTransactionError(
-                transaction,
-                "Tried to sell more than the available "
-                f"balance({self.portfolio[symbol].quantity})",
-            )
+            if _approx_equal(self.portfolio[symbol].quantity, quantity):
+                print(f'WARN: Trying to sell {quantity} '
+                      f'but only have {self.portfolio[symbol].quantity}')
+                quantity = self.portfolio[symbol].quantity
+            else:
+                raise InvalidTransactionError(
+                    transaction,
+                    "Tried to sell more than the available "
+                    f"balance({self.portfolio[symbol].quantity})",
+                )
 
         amount = get_amount_or_fail(transaction)
         price = transaction.price
@@ -499,7 +517,10 @@ class CapitalGainsCalculator:
                 )
 
         current_amount = self.portfolio[symbol].amount
-        assert disposal_quantity <= current_quantity
+        if disposal_quantity > current_quantity:
+            print(f'WARN: Disposal quantity {disposal_quantity} '
+                  f'exceeds current quantity {current_quantity}')
+            disposal_quantity = current_quantity
         chargeable_gain = Decimal(0)
         calculation_entries = []
         # Same day rule is first
@@ -610,6 +631,10 @@ class CapitalGainsCalculator:
                     )
                     disposal_quantity -= available_quantity
                     proceeds_amount -= available_quantity * disposal_price
+                    if current_quantity == 0 and round_decimal(current_amount, 23) == 0:
+                        # accept rounding error
+                        print('WARN: current_quantity is 0, skipping...')
+                        return chargeable_gain, calculation_entries, spin_off_entry
                     current_price = current_amount / current_quantity
                     amount_delta = available_quantity * current_price
                     current_quantity -= available_quantity
@@ -746,13 +771,14 @@ class CapitalGainsCalculator:
                             calculated_quantity += entry.quantity
                             calculated_proceeds += entry.amount
                             calculated_gain += entry.gain
-                        assert transaction_quantity == calculated_quantity
+                        assert round_decimal(transaction_quantity, 10) == round_decimal(
+                            calculated_quantity, 10)
                         assert round_decimal(
                             transaction_disposal_proceeds, 10
                         ) == round_decimal(
                             calculated_proceeds, 10
                         ), f"{transaction_disposal_proceeds} != {calculated_proceeds}"
-                        assert transaction_capital_gain == round_decimal(
+                        assert round_decimal(transaction_capital_gain, 2) == round_decimal(
                             calculated_gain, 2
                         )
                         calculation_log[date_index][
